@@ -45,6 +45,8 @@ fn main() {
     );
     let target = env::var("TARGET").unwrap();
     let windows = target.contains("windows");
+    let needs_http2 = cfg!(feature = "http2");
+    let needs_cares = cfg!(feature = "c-ares");
 
     if cfg!(feature = "mesalink") {
         println!("cargo:warning=MesaLink support has been removed as of curl 7.82.0, will use default TLS backend instead.");
@@ -61,7 +63,10 @@ fn main() {
     if !cfg!(feature = "static-curl") {
         // OSX ships libcurl by default, so we just use that version
         // so long as it has the right features enabled.
-        if target.contains("apple") && (!cfg!(feature = "http2") || curl_config_reports_http2()) {
+        if target.contains("apple")
+            && (!needs_http2 || curl_config_reports_http2())
+            && (!needs_cares || curl_config_reports_cares())
+        {
             return println!("cargo:rustc-flags=-l curl");
         }
 
@@ -70,7 +75,7 @@ fn main() {
             if try_vcpkg() {
                 return;
             }
-        } else if try_pkg_config() {
+        } else if try_pkg_config(needs_http2, needs_cares) {
             return;
         }
     }
@@ -161,7 +166,6 @@ fn main() {
         .define("HAVE_BOOL_T", None)
         .define("HAVE_STDBOOL_H", None)
         .define("HAVE_STDINT_H", None)
-        .define("USE_RESOLV_THREADED", None)
         .file("curl/lib/altsvc.c")
         .file("curl/lib/api.c")
         .file("curl/lib/bufq.c")
@@ -302,6 +306,17 @@ fn main() {
         .define("HAVE_GETPEERNAME", None)
         .define("HAVE_GETSOCKNAME", None)
         .warnings(false);
+
+    // One asynchronous resolver: c-ares when asked for, otherwise curl's
+    // threaded resolver.
+    if needs_cares {
+        cfg.define("USE_ARES", None)
+            .define("USE_RESOLV_ARES", None)
+            .file("curl/lib/vdns/asyn-ares.c");
+        configure_cares(&mut cfg, windows);
+    } else {
+        cfg.define("USE_RESOLV_THREADED", None);
+    }
 
     if cfg!(feature = "ntlm") {
         cfg.file("curl/lib/curl_endian.c")
@@ -587,10 +602,10 @@ fn try_vcpkg() -> bool {
     false
 }
 
-fn try_pkg_config() -> bool {
-    let mut cfg = pkg_config::Config::new();
-    cfg.cargo_metadata(false);
-    let lib = match cfg.probe("libcurl") {
+fn try_pkg_config(needs_http2: bool, needs_cares: bool) -> bool {
+    let mut pkgcfg = pkg_config::Config::new();
+    pkgcfg.cargo_metadata(false);
+    let lib = match pkgcfg.probe("libcurl") {
         Ok(lib) => lib,
         Err(e) => {
             println!(
@@ -604,13 +619,23 @@ fn try_pkg_config() -> bool {
 
     // Not all system builds of libcurl have http2 features enabled, so if we've
     // got a http2-requested build then we may fall back to a build from source.
-    if cfg!(feature = "http2") && !curl_config_reports_http2() {
+    if needs_http2 && !curl_config_reports_http2() {
+        return false;
+    }
+
+    // c-ares support is required for CURLOPT_DNS_SERVERS and related APIs.
+    // If we cannot confirm the system libcurl was configured with c-ares,
+    // fall back to compiling libcurl from source.
+    if needs_cares
+        && !pkg_config_reports_cares(&lib)
+        && !curl_config_reports_cares()
+    {
         return false;
     }
 
     // Re-find the library to print cargo's metadata, then print some extra
     // metadata as well.
-    cfg.cargo_metadata(true).probe("libcurl").unwrap();
+    pkgcfg.cargo_metadata(true).probe("libcurl").unwrap();
     for path in lib.include_paths.iter() {
         println!("cargo:include={}", path.display());
     }
@@ -640,4 +665,95 @@ fn curl_config_reports_http2() -> bool {
     }
 
     true
+}
+
+fn pkg_config_reports_cares(lib: &pkg_config::Library) -> bool {
+    if lib.libs.iter().any(|name| name.contains("cares")) {
+        return true;
+    }
+
+    println!(
+        "failed to find c-ares in pkg-config metadata for libcurl, \
+         validating with curl-config"
+    );
+    false
+}
+
+fn curl_config_reports_cares() -> bool {
+    let output = Command::new("curl-config").arg("--configure").output();
+    let output = match output {
+        Ok(out) => out,
+        Err(e) => {
+            println!("failed to run curl-config ({}), building from source", e);
+            return false;
+        }
+    };
+    if !output.status.success() {
+        println!("curl-config failed: {}", output.status);
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("--enable-ares") && !stdout.contains("--with-ares") {
+        println!(
+            "failed to find c-ares enabled in pkg-config-found libcurl, \
+             building from source"
+        );
+        return false;
+    }
+
+    true
+}
+
+fn configure_cares(cfg: &mut cc::Build, windows: bool) {
+    if windows {
+        if try_vcpkg_cares(cfg) {
+            return;
+        }
+    } else if try_pkg_config_cares(cfg) {
+        return;
+    }
+
+    panic!(
+        "c-ares support requires a discoverable c-ares installation (via vcpkg \
+         on Windows or pkg-config on non-Windows platforms)"
+    );
+}
+
+#[cfg(not(target_env = "msvc"))]
+fn try_vcpkg_cares(_cfg: &mut cc::Build) -> bool {
+    false
+}
+
+#[cfg(target_env = "msvc")]
+fn try_vcpkg_cares(cfg: &mut cc::Build) -> bool {
+    let lib = match vcpkg::Config::new().emit_includes(true).probe("c-ares") {
+        Ok(lib) => lib,
+        Err(e) => {
+            println!("vcpkg could not find c-ares: {}", e);
+            return false;
+        }
+    };
+
+    for include in lib.include_paths {
+        cfg.include(include);
+    }
+    true
+}
+
+fn try_pkg_config_cares(cfg: &mut cc::Build) -> bool {
+    for package in ["libcares", "c-ares"] {
+        match pkg_config::Config::new().probe(package) {
+            Ok(lib) => {
+                for include in lib.include_paths {
+                    cfg.include(include);
+                }
+                return true;
+            }
+            Err(e) => {
+                println!("pkg-config could not find {}: {}", package, e);
+            }
+        }
+    }
+
+    false
 }

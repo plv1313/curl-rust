@@ -132,6 +132,7 @@ with various Cargo features:
 - `static-curl`: Use a bundled libcurl version and statically link to it. Disabled by default.
 - `apple-sectrust`: Use Apple SecTrust for certificate verification with bundled libcurl and OpenSSL on Apple platforms. Implies `ssl` and `static-curl`. Disabled by default.
 - `static-ssl`: Use a bundled OpenSSL version and statically link to it. Only applies on platforms that use OpenSSL. Disabled by default.
+- `c-ares`: Build libcurl with c-ares DNS support. Useful with `static-curl` if you need c-ares-only options such as `CURLOPT_DNS_SERVERS`. Requires c-ares development files discoverable by `pkg-config` (or `vcpkg` on MSVC Windows). Disabled by default.
 - `spnego`: Enable SPNEGO support. Disabled by default.
 - `upkeep_7_62_0`: Enable curl_easy_upkeep() support, introduced in curl 7.62.0. Disabled by default.
 - `poll_7_68_0`: Enable curl_multi_poll()/curl_multi_wakeup() support, requires curl 7.68.0 or later. Disabled by default.
